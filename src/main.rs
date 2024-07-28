@@ -1,10 +1,14 @@
 #![feature(test)]
 
+mod commands;
 mod test;
 
+#[cfg(not(test))]
+use indicatif_log_bridge::LogWrapper;
+
+use crate::commands::*;
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use indicatif_log_bridge::LogWrapper;
 use ini::Ini;
 use log::{error, info};
 use std::ffi::OsString;
@@ -14,6 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
@@ -157,106 +162,6 @@ fn main() {
     }
 }
 
-fn revert(config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"revert".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
-    let mut setter = config.with_section(Some("Backups"));
-    let mut vec = match setter.get(hash) {
-        Some(v) => v.split(SEPARATOR),
-        None => {
-            eprintln!("Couldn't find \"{}\".", hash);
-            return;
-        }
-    };
-    let mut dest_str = PathBuf::from(vec.nth(0).unwrap().to_string());
-    dest_str.pop();
-    let dest_str = dest_str.to_str().unwrap().to_string();
-    let mut source_str = vec.nth(0).unwrap().to_string(); // Getting the first element again because .nth() consumes all preceding and the returned element
-
-    _copy(config_dir, &mut config, args, &mut source_str, dest_str);
-}
-
-fn delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"delete".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
-    let mut setter = config.with_section(Some("Backups"));
-    let dest = match setter.get(hash) {
-        Some(v) => v.split(SEPARATOR).collect::<Vec<&str>>()[1],
-        None => {
-            eprintln!("Couldn't find \"{}\".", hash);
-            return;
-        }
-    };
-
-    match fs::remove_dir_all(dest) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("{} {}", "Error:".red().bold(), e);
-        }
-    };
-    println!("Deleted {}", dest);
-    _delete_entry(&mut config_dir, &mut config, hash);
-}
-
-fn soft_delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"soft-delete".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
-    if _delete_entry(&mut config_dir, &mut config, hash) {
-        println!("Deleted {}", hash);
-        return;
-    }
-    eprintln!("Couldn't find \"{}\".", hash);
-}
-
-fn list(config: Ini) {
-    for (sec, prop) in &config {
-        if sec == Some("Backups") {
-            for (k, v) in prop.iter() {
-                let v: Vec<&str> = v.split(SEPARATOR).collect();
-                println!(
-                    "{} {k}\n   {} {}\n   {} {}",
-                    "ID:".bold(),
-                    "Source:".bold(),
-                    v[0],
-                    "Destination:".bold(),
-                    v[1]
-                );
-            }
-        }
-    }
-}
-
-// Returns whether early return was done.
 fn _copy(
     config_dir: PathBuf,
     config: &mut Ini,
@@ -345,16 +250,6 @@ fn _copy(
     false
 }
 
-fn _delete_entry(config_dir: &mut PathBuf, config: &mut Ini, hash: &String) -> bool {
-    if config.with_section(Some("Backups")).get(hash).is_some() {
-        config.with_section(Some("Backups")).delete(hash);
-    } else {
-        return false;
-    }
-    config.write_to_file(config_dir.join("config.ini")).unwrap();
-    true
-}
-
 fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     let mut stack = vec![src];
     let mut file_list = Vec::new();
@@ -365,10 +260,11 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     let multi = MultiProgress::new();
     multi.set_move_cursor(true);
 
-    let logger = colog::default_builder().build();
-
     #[cfg(not(test))]
-    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    {
+        let logger = colog::default_builder().build();
+        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    }
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
 
@@ -384,12 +280,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     pb.set_position(0);
 
     let pb_clone = pb.clone();
-    let t = std::thread::spawn(move || {
-        while !pb_clone.is_finished() {
-            pb_clone.tick();
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let t = _pb_update(pb_clone);
 
     while let Some(curr_dir) = stack.pop() {
         for entry in curr_dir {
@@ -442,12 +333,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     pb.set_position(0);
 
     let pb_clone = pb.clone();
-    let t = std::thread::spawn(move || {
-        while !pb_clone.is_finished() {
-            pb_clone.tick();
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let t = _pb_update(pb_clone);
 
     for e in file_list {
         let p = e.0.path();
@@ -482,6 +368,15 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     };
 }
 
+fn _pb_update(pb_clone: ProgressBar) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !pb_clone.is_finished() {
+            pb_clone.tick();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+}
+
 fn multithread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     let conclusion = Arc::new(Mutex::new(Conclusion::new()));
 
@@ -508,9 +403,12 @@ fn _multithread(
 
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(255));
     multi.set_move_cursor(true);
-    let logger = colog::default_builder().build();
+
     #[cfg(not(test))]
-    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    {
+        let logger = colog::default_builder().build();
+        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    }
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
 
@@ -526,12 +424,7 @@ fn _multithread(
     pb.set_position(0);
 
     let pb_clone = pb.clone();
-    let t = std::thread::spawn(move || {
-        while !pb_clone.is_finished() {
-            pb_clone.tick();
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let t = _pb_update(pb_clone);
 
     _multithread_discover(
         src,
@@ -558,12 +451,7 @@ fn _multithread(
     pb.set_position(0);
 
     let pb_clone = pb.clone();
-    let t = std::thread::spawn(move || {
-        while !pb_clone.is_finished() {
-            pb_clone.tick();
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    });
+    let t = _pb_update(pb_clone);
 
     let files_list_clone = files_list.clone();
     let mut lock = files_list_clone.lock().unwrap();
