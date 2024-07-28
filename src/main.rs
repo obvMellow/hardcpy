@@ -1,3 +1,7 @@
+#![feature(test)]
+
+mod test;
+
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
@@ -148,13 +152,7 @@ fn main() {
                 return;
             }
 
-            _copy(
-                config_dir,
-                &mut config,
-                &args,
-                &mut source_str,
-                &mut dest_str,
-            );
+            _copy(config_dir, &mut config, &args, &mut source_str, dest_str);
         }
     }
 }
@@ -182,16 +180,10 @@ fn revert(config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
     };
     let mut dest_str = PathBuf::from(vec.nth(0).unwrap().to_string());
     dest_str.pop();
-    let mut dest_str = dest_str.to_str().unwrap().to_string();
+    let dest_str = dest_str.to_str().unwrap().to_string();
     let mut source_str = vec.nth(0).unwrap().to_string(); // Getting the first element again because .nth() consumes all preceding and the returned element
 
-    _copy(
-        config_dir,
-        &mut config,
-        args,
-        &mut source_str,
-        &mut dest_str,
-    );
+    _copy(config_dir, &mut config, args, &mut source_str, dest_str);
 }
 
 fn delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
@@ -270,7 +262,7 @@ fn _copy(
     config: &mut Ini,
     args: &Vec<String>,
     source_str: &mut String,
-    dest_str: &mut String,
+    dest_str: String,
 ) -> bool {
     let source_name = PathBuf::from(&source_str).iter().last().unwrap().to_owned();
 
@@ -375,6 +367,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
 
     let logger = colog::default_builder().build();
 
+    #[cfg(not(test))]
     LogWrapper::new(multi.clone(), logger).try_init().unwrap();
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
@@ -516,6 +509,7 @@ fn _multithread(
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(255));
     multi.set_move_cursor(true);
     let logger = colog::default_builder().build();
+    #[cfg(not(test))]
     LogWrapper::new(multi.clone(), logger).try_init().unwrap();
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
