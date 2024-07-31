@@ -99,26 +99,23 @@ struct Args {
 enum Commands {
     List,
     SoftDelete {
-        #[arg(short, long)]
         id: String,
     },
     Delete {
-        #[arg(short, long)]
         id: String,
     },
     Revert {
-        #[arg(short, long)]
         id: String,
 
         #[arg(short, long)]
-        multithread: bool
+        multithread: bool,
     },
     Create {
         source: PathBuf,
         dest: PathBuf,
 
         #[arg(short, long)]
-        multithread: bool
+        multithread: bool,
     },
 }
 
@@ -144,7 +141,11 @@ fn main() {
         Commands::SoftDelete { id } => soft_delete(config_dir, config, id),
         Commands::Delete { id } => delete(config_dir, config, id),
         Commands::Revert { id, multithread } => revert(config_dir, config, id, multithread),
-        Commands::Create { source, dest, multithread } => {
+        Commands::Create {
+            source,
+            dest,
+            multithread,
+        } => {
             _copy(config_dir, &mut config, multithread, source, dest);
         }
     }
