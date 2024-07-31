@@ -89,7 +89,7 @@ impl From<u64> for FileSize {
 }
 
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Simple backup tool written in Rust", long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -97,19 +97,20 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Lists all backups saved
     List,
-    SoftDelete {
-        id: String,
-    },
-    Delete {
-        id: String,
-    },
+    /// Deletes the entry for a backup. Doesn't delete the actual files
+    SoftDelete { id: String },
+    /// Deletes the backup
+    Delete { id: String },
+    /// Reverts a backup. Copies destination to source, recovering the source
     Revert {
         id: String,
 
         #[arg(short, long)]
         multithread: bool,
     },
+    /// Creates a backup
     Create {
         source: PathBuf,
         dest: PathBuf,
