@@ -4,53 +4,35 @@ use ini::Ini;
 use std::fs;
 use std::path::PathBuf;
 
-pub fn revert(config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"revert".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
+pub fn revert(config_dir: PathBuf, mut config: Ini, id: String, multithread: bool) {
     let mut setter = config.with_section(Some("Backups"));
-    let mut vec = match setter.get(hash) {
+    let mut vec = match setter.get(&id) {
         Some(v) => v.split(SEPARATOR),
         None => {
-            eprintln!("Couldn't find \"{}\".", hash);
+            eprintln!("Couldn't find \"{}\".", id);
             return;
         }
     };
     let mut dest_str = PathBuf::from(vec.nth(0).unwrap().to_string());
     dest_str.pop();
     let dest_str = dest_str.to_str().unwrap().to_string();
-    let mut source_str = vec.nth(0).unwrap().to_string(); // Getting the first element again because .nth() consumes all preceding and the returned element
+    let source_str = vec.nth(0).unwrap().to_string(); // Getting the first element again because .nth() consumes all preceding and the returned element
 
-    _copy(config_dir, &mut config, args, &mut source_str, dest_str);
+    _copy(
+        config_dir,
+        &mut config,
+        multithread,
+        source_str.into(),
+        dest_str.into(),
+    );
 }
 
-pub fn delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"delete".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
+pub fn delete(mut config_dir: PathBuf, mut config: Ini, id: String) {
     let mut setter = config.with_section(Some("Backups"));
-    let dest = match setter.get(hash) {
+    let dest = match setter.get(&id) {
         Some(v) => v.split(SEPARATOR).collect::<Vec<&str>>()[1],
         None => {
-            eprintln!("Couldn't find \"{}\".", hash);
+            eprintln!("Couldn't find \"{}\".", id);
             return;
         }
     };
@@ -62,27 +44,15 @@ pub fn delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
         }
     };
     println!("Deleted {}", dest);
-    _delete_entry(&mut config_dir, &mut config, hash);
+    _delete_entry(&mut config_dir, &mut config, &id);
 }
 
-pub fn soft_delete(mut config_dir: PathBuf, mut config: Ini, args: &Vec<String>) {
-    let i = args
-        .iter()
-        .position(|v| v == &"soft-delete".to_string())
-        .unwrap();
-    let hash = match args.get(i + 1) {
-        Some(v) => v,
-        None => {
-            eprintln!("Please enter a valid ID.");
-            return;
-        }
-    };
-
-    if _delete_entry(&mut config_dir, &mut config, hash) {
-        println!("Deleted {}", hash);
+pub fn soft_delete(mut config_dir: PathBuf, mut config: Ini, id: String) {
+    if _delete_entry(&mut config_dir, &mut config, &id) {
+        println!("Deleted {}", id);
         return;
     }
-    eprintln!("Couldn't find \"{}\".", hash);
+    eprintln!("Couldn't find \"{}\".", id);
 }
 
 pub fn list(config: Ini) {
@@ -103,9 +73,9 @@ pub fn list(config: Ini) {
     }
 }
 
-fn _delete_entry(config_dir: &mut PathBuf, config: &mut Ini, hash: &String) -> bool {
-    if config.with_section(Some("Backups")).get(hash).is_some() {
-        config.with_section(Some("Backups")).delete(hash);
+fn _delete_entry(config_dir: &mut PathBuf, config: &mut Ini, id: &String) -> bool {
+    if config.with_section(Some("Backups")).get(id).is_some() {
+        config.with_section(Some("Backups")).delete(id);
     } else {
         return false;
     }

@@ -1,5 +1,3 @@
-#![feature(test)]
-
 mod commands;
 mod test;
 
@@ -7,6 +5,7 @@ mod test;
 use indicatif_log_bridge::LogWrapper;
 
 use crate::commands::*;
+use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use ini::Ini;
@@ -89,17 +88,39 @@ impl From<u64> for FileSize {
     }
 }
 
-const HELP_STR: &str = "\
-Usage: hardcpy [SOURCE] [DESTINATION] [OPTIONS]
-       hardcpy [COMMAND]
-    Commands:
-        help: Prints this message.
-        list: Lists all the backups you have created so far.
-        soft-delete: Deletes the entry for a backup. This does not delete any of the files.
-        delete: Deletes a backup.
-        revert: Copies a backup to it's original source. Note that this creates a new backup entry.
-    Options:
-        --multi-thread: Utilize multi-threading. Can be faster on very large folders.";
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    List,
+    SoftDelete {
+        #[arg(short, long)]
+        id: String,
+    },
+    Delete {
+        #[arg(short, long)]
+        id: String,
+    },
+    Revert {
+        #[arg(short, long)]
+        id: String,
+
+        #[arg(short, long)]
+        multithread: bool
+    },
+    Create {
+        source: PathBuf,
+        dest: PathBuf,
+
+        #[arg(short, long)]
+        multithread: bool
+    },
+}
 
 const SEPARATOR: char = '┇';
 
@@ -116,48 +137,15 @@ fn main() {
 
     let mut config = Ini::load_from_file(config_dir.join("config.ini")).unwrap_or(Ini::new());
 
-    let args: Vec<String> = std::env::args().collect();
+    let args = Args::parse();
 
-    if args.len() < 2 {
-        println!("{}", HELP_STR);
-        return;
-    }
-
-    let cmd = &args[1];
-
-    match cmd.as_str() {
-        "help" => println!("{}", HELP_STR),
-        "list" => list(config),
-        "soft-delete" => soft_delete(config_dir, config, &args),
-        "delete" => delete(config_dir, config, &args),
-        "revert" => revert(config_dir, config, &args),
-        _ => {
-            let mut source_str = "".to_string();
-            let mut dest_str = "".to_string();
-            for arg in args.clone() {
-                if arg.starts_with("--")
-                    || std::env::current_exe()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                        .contains(&arg)
-                {
-                    continue;
-                }
-
-                if source_str.is_empty() {
-                    source_str = arg;
-                } else {
-                    dest_str = arg;
-                }
-            }
-
-            if source_str.is_empty() || dest_str.is_empty() {
-                println!("{}", HELP_STR);
-                return;
-            }
-
-            _copy(config_dir, &mut config, &args, &mut source_str, dest_str);
+    match args.command {
+        Commands::List => list(config),
+        Commands::SoftDelete { id } => soft_delete(config_dir, config, id),
+        Commands::Delete { id } => delete(config_dir, config, id),
+        Commands::Revert { id, multithread } => revert(config_dir, config, id, multithread),
+        Commands::Create { source, dest, multithread } => {
+            _copy(config_dir, &mut config, multithread, source, dest);
         }
     }
 }
@@ -165,16 +153,16 @@ fn main() {
 fn _copy(
     config_dir: PathBuf,
     config: &mut Ini,
-    args: &Vec<String>,
-    source_str: &mut String,
-    dest_str: String,
+    is_multithread: bool,
+    source_str: PathBuf,
+    dest_str: PathBuf,
 ) -> bool {
-    let source_name = PathBuf::from(&source_str).iter().last().unwrap().to_owned();
+    let source_name = source_str.iter().last().unwrap().to_owned();
 
     let source = match fs::read_dir(&source_str) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error: {} (\"{}\")", e, source_str);
+            eprintln!("Error: {} (\"{}\")", e, source_str.display());
             return true;
         }
     };
@@ -182,7 +170,12 @@ fn _copy(
     match fs::create_dir_all(&dest_str) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("{} {} (\"{}\")", "Error:".red().bold(), e, dest_str);
+            eprintln!(
+                "{} {} (\"{}\")",
+                "Error:".red().bold(),
+                e,
+                dest_str.display()
+            );
             return true;
         }
     }
@@ -190,15 +183,16 @@ fn _copy(
     let timer = Instant::now();
     let conclusion;
 
-    if args.contains(&"--multi-thread".to_string()) {
+    if is_multithread {
         conclusion = multithread(source, PathBuf::from(&dest_str), source_name.clone());
     } else {
         conclusion = singlethread(source, PathBuf::from(&dest_str), source_name.clone());
     }
 
     let v = format!(
-        "{source_str}{SEPARATOR}{}",
-        PathBuf::from(&dest_str).join(source_name).to_str().unwrap()
+        "{}{SEPARATOR}{}",
+        source_str.display(),
+        dest_str.join(source_name).to_str().unwrap()
     );
     let mut hasher = fnv::FnvHasher::default();
     v.hash(&mut hasher);
