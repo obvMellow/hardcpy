@@ -1,3 +1,6 @@
+
+[![Build hardcpy](https://github.com/obvMellow/hardcpy/actions/workflows/rust.yml/badge.svg)](https://github.com/obvMellow/hardcpy/actions/workflows/rust.yml)
+
 # hardcpy
 Simple backup tool written in Rust
 
