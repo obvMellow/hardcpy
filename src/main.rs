@@ -1,6 +1,7 @@
 mod commands;
 mod test;
 
+use fdlimit::{raise_fd_limit, Outcome};
 #[cfg(not(test))]
 use indicatif_log_bridge::LogWrapper;
 
@@ -10,10 +11,11 @@ use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use ini::Ini;
 use log::{error, info};
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{DirEntry, File, ReadDir};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::{Arc, Mutex};
@@ -247,11 +249,13 @@ fn _copy(
 }
 
 fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
-    let mut stack = vec![src];
-    let mut file_list = Vec::new();
+    let mut stack = VecDeque::new();
+    stack.push_front(src);
+    let mut file_list: VecDeque<(DirEntry, &OsString, &PathBuf)> = VecDeque::new();
     let mut error_count = 0;
     let mut error_list = Vec::new();
     let mut total_size = FileSize::new();
+    let mut curr_progress = 0;
 
     let multi = MultiProgress::new();
     multi.set_move_cursor(true);
@@ -278,7 +282,11 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     let pb_clone = pb.clone();
     let t = _pb_update(pb_clone);
 
-    while let Some(curr_dir) = stack.pop() {
+    if let Outcome::LimitRaised { from, to } = raise_fd_limit().unwrap() {
+        info!("Increased max files open limit from {} to {}", from, to);
+    }
+
+    while let Some(curr_dir) = stack.pop_front() {
         for entry in curr_dir {
             let entry = entry.unwrap();
             let entry_path = entry.path();
@@ -287,23 +295,75 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
                 // If it's a directory, push its contents onto the stack
                 let dir_content = match fs::read_dir(&entry_path) {
                     Ok(v) => v,
-                    Err(e) => {
-                        let err = format!(
-                            "Couldn't read {:#?} because of error: {e}. Skipping\n",
-                            entry_path
-                        );
-                        error!("{}", err);
-                        error_list.push(err);
-                        continue;
-                    }
+                    Err(e) => match e.raw_os_error().unwrap_or(0) {
+                        24 => {
+                            error!("Too many file handles open, switching to copying.");
+                            for _ in 0..5 {
+                                stack.pop_front();
+                            }
+                            let mut progress;
+                            let total = total_size.byte;
+                            let pb = multi.add(ProgressBar::new(total as u64));
+                            pb.set_style(
+                                ProgressStyle::with_template(
+                                    "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                                )
+                                .unwrap()
+                                .progress_chars("#>-"),
+                            );
+
+                            pb.set_position(curr_progress);
+
+                            let pb_clone = pb.clone();
+                            let t = _pb_update(pb_clone);
+
+                            while let Some(f) = file_list.pop_front() {
+                                let p = f.0.path();
+
+                                progress = f.0.metadata().unwrap().len();
+                                curr_progress += progress;
+                                info!(
+                                    "{} \"{}\" ({})",
+                                    "Copying".green().bold(),
+                                    p.display(),
+                                    FileSize::from(progress).to_string().bold()
+                                );
+
+                                if let Err(e) = _copy_file(&f.0, f.1, f.2) {
+                                    let err = format!(
+                                        "Couldn't copy {:#?} because of error: {e}. Skipping\n",
+                                        p
+                                    );
+                                    error!("{}", err);
+                                    error_count += 1;
+                                    error_list.push(err);
+                                    continue;
+                                }
+                                pb.inc(progress);
+                            }
+                            pb.finish();
+                            multi.remove(&pb);
+                            t.join().unwrap();
+
+                            continue;
+                        }
+                        _ => {
+                            let err = format!(
+                                "Couldn't read {:#?} because of error: {e}. Skipping",
+                                entry_path
+                            );
+                            error!("{}", err);
+                            continue;
+                        }
+                    },
                 };
-                stack.push(dir_content);
+                stack.push_back(dir_content);
             } else if entry.file_type().unwrap().is_file() {
                 // If it's a file, add to the list
                 info!("{} {:#?}.", "Discovered".green().bold(), entry.path());
 
                 total_size.byte += entry.metadata().unwrap().len() as usize;
-                file_list.push((entry, &src_name, &dest));
+                file_list.push_front((entry, &src_name, &dest));
                 pb.inc(1);
             }
         }
@@ -326,15 +386,15 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
         .progress_chars("#>-"),
     );
 
-    pb.set_position(0);
+    pb.set_position(curr_progress);
 
     let pb_clone = pb.clone();
     let t = _pb_update(pb_clone);
 
-    for e in file_list {
-        let p = e.0.path();
+    while let Some(f) = file_list.pop_front() {
+        let p = f.0.path();
 
-        progress = e.0.metadata().unwrap().len();
+        progress = f.0.metadata().unwrap().len();
         info!(
             "{} \"{}\" ({})",
             "Copying".green().bold(),
@@ -342,7 +402,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
             FileSize::from(progress).to_string().bold()
         );
 
-        if let Err(e) = _copy_file(&e.0, e.1, e.2) {
+        if let Err(e) = _copy_file(&f.0, f.1, f.2) {
             let err = format!("Couldn't copy {:#?} because of error: {e}. Skipping\n", p);
             error!("{}", err);
             error_count += 1;
@@ -351,6 +411,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
         }
         pb.inc(progress);
     }
+
     pb.finish();
     multi.remove(&pb);
     t.join().unwrap();
@@ -406,6 +467,9 @@ fn _multithread(
         LogWrapper::new(multi.clone(), logger).try_init().unwrap();
     }
 
+    if let Outcome::LimitRaised { from, to } = raise_fd_limit().unwrap() {
+        info!("Increased max files open limit from {} to {}", from, to);
+    }
     let pb = multi.add(ProgressBar::new(u64::MAX));
 
     pb.set_style(
