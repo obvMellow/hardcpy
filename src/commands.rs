@@ -1,8 +1,101 @@
-use crate::{_copy, SEPARATOR};
+use crate::{_copy, _pb_update, SEPARATOR};
 use colored::Colorize;
+use indicatif::{HumanCount, MultiProgress, ProgressBar, ProgressStyle};
+use indicatif_log_bridge::LogWrapper;
 use ini::Ini;
-use std::fs;
+use log::{error, info};
+use sha2::{Digest, Sha256};
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::PathBuf;
+
+pub fn verify(config: Ini, id: String) {
+    let mut error_list = Vec::new();
+    let mut verified = 0;
+    let mut copied = 0;
+    let iter = config.section(Some(format!("Backup.{}", id))).unwrap();
+    let multi = MultiProgress::new();
+    let logger = colog::default_builder().build();
+    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+
+    let pb = multi.add(ProgressBar::new(iter.len() as u64));
+
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg:.blue.bold} [{bar:50.cyan/blue}] {human_pos}/{human_len} [{elapsed_precise}] ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb.set_message("Verifying");
+
+    pb.set_position(0);
+
+    let pb_clone = pb.clone();
+    let t = _pb_update(pb_clone);
+
+    for (k, v) in iter {
+        let mut split = v.split(SEPARATOR);
+        let to = split.nth(0).unwrap();
+        info!("{} \"{to}\"", "Verifying".green().bold());
+        let mut read_from = match File::open(to) {
+            Ok(v) => v,
+            Err(_) => {
+                info!("\n{} {k}", "Copying".blue().bold());
+                match fs::copy(k, to) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("{e}");
+                        error_list.push(e);
+                        continue;
+                    }
+                };
+                copied += 1;
+                File::open(to).unwrap()
+            }
+        };
+        let mut hasher = Sha256::new();
+
+        let file_size = read_from.metadata().unwrap().len();
+        let max_buf_size = 1024 * 1024 * 1024 * 4;
+        let buf_size = file_size.min(max_buf_size);
+        let mut buf = Vec::with_capacity(buf_size as usize);
+        while read_from.read_to_end(&mut buf).unwrap() > 0 {
+            hasher.update(&buf);
+            if buf_size == file_size {
+                break;
+            }
+        }
+
+        let hash = format!("{:X}", hasher.finalize());
+        if hash != split.nth(0).unwrap() {
+            info!("\n{} \"{to}\"", "Copying".green().bold());
+            match fs::copy(k, to) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("{e}");
+                    error_list.push(e);
+                    continue;
+                }
+            };
+            copied += 1;
+        }
+        verified += 1;
+        pb.inc(1);
+    }
+    pb.finish();
+    t.join().unwrap();
+    multi.remove(&pb);
+
+    println!(
+        "{} {} out of {} files. Copied {} files. ({} errors occured)",
+        "Verified".green().bold(),
+        HumanCount(verified).to_string(),
+        HumanCount(iter.len() as u64).to_string(),
+        HumanCount(copied).to_string(),
+        HumanCount(error_list.len() as u64).to_string(),
+    );
+}
 
 pub fn revert(config_dir: PathBuf, mut config: Ini, id: String, multithread: bool) {
     let mut setter = config.with_section(Some("Backups"));

@@ -122,6 +122,8 @@ enum Commands {
         #[arg(short, long)]
         multithread: bool,
     },
+    /// Verifies that the tracked source files match destination files
+    Verify { id: String },
 }
 
 const SEPARATOR: char = '┇';
@@ -153,6 +155,7 @@ fn main() {
         } => {
             _copy(config_dir, &mut config, multithread, source, dest);
         }
+        Commands::Verify { id } => verify(config, id),
     }
 }
 
@@ -238,7 +241,7 @@ fn _copy(
         let max_buf_size = 1024 * 1024 * 1024 * 4;
         let buf_size = file_size.min(max_buf_size);
         let mut buf = Vec::with_capacity(buf_size as usize);
-        while read_from.read(&mut buf).unwrap() != 0 {
+        while read_from.read_to_end(&mut buf).unwrap() > 0 {
             hasher.update(&buf);
         }
 
@@ -284,7 +287,7 @@ fn _copy(
         let max_buf_size = 1024 * 1024 * 1024 * 4;
         let buf_size = file_size.min(max_buf_size);
         let mut buf = Vec::with_capacity(buf_size as usize);
-        while read_from.read(&mut buf).unwrap() != 0 {
+        while read_from.read_to_end(&mut buf).unwrap() > 0 {
             hasher.update(&buf);
         }
 
