@@ -2,8 +2,8 @@ mod commands;
 mod test;
 
 use fdlimit::{raise_fd_limit, Outcome};
-#[cfg(not(test))]
 use indicatif_log_bridge::LogWrapper;
+use sha2::{Digest, Sha256};
 
 use crate::commands::*;
 use clap::{Parser, Subcommand};
@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs::{DirEntry, File, ReadDir};
 use std::hash::{Hash, Hasher};
-use std::io::{ErrorKind, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,7 @@ struct Conclusion {
     pub error_count: usize,
     pub error_list: Vec<String>,
     pub total_size: FileSize,
+    pub path_list: Vec<(PathBuf, PathBuf)>,
 }
 
 #[derive(Copy, Clone)]
@@ -46,6 +47,7 @@ impl Conclusion {
             error_count: 0,
             error_list: Vec::new(),
             total_size: FileSize::new(),
+            path_list: Vec::new(),
         }
     }
 }
@@ -186,25 +188,114 @@ fn _copy(
 
     let timer = Instant::now();
     let conclusion;
+    let multi;
 
     if is_multithread {
-        conclusion = multithread(source, PathBuf::from(&dest_str), source_name.clone());
+        (conclusion, multi) = multithread(source, PathBuf::from(&dest_str), source_name.clone());
     } else {
-        conclusion = singlethread(source, PathBuf::from(&dest_str), source_name.clone());
+        (conclusion, multi) = singlethread(source, PathBuf::from(&dest_str), source_name.clone());
     }
 
     let v = format!(
         "{}{SEPARATOR}{}",
         source_str.display(),
-        dest_str.join(source_name).to_str().unwrap()
+        dest_str.join(source_name.clone()).to_str().unwrap()
     );
     let mut hasher = fnv::FnvHasher::default();
     v.hash(&mut hasher);
-    config
-        .with_section(Some("Backups"))
-        .set(hasher.finish().to_string(), v);
+    let h = hasher.finish().to_string();
+    config.with_section(Some("Backups")).set(h.clone(), v);
 
+    multi.clear().unwrap();
+    multi.set_move_cursor(true);
+
+    let pb = multi.add(ProgressBar::new(conclusion.total_count as u64));
+
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg:.blue.bold} [{bar:50.cyan/blue}] {human_pos}/{human_len} [{elapsed_precise}] ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb.set_message("Hashing");
+
+    pb.set_position(0);
+
+    let pb_clone = pb.clone();
+    let t = _pb_update(pb_clone);
+
+    if let Outcome::LimitRaised { from, to } = raise_fd_limit().unwrap() {
+        info!("Increased max files open limit from {} to {}", from, to);
+    }
+
+    for (from, to) in conclusion.path_list {
+        let mut read_from = File::open(from.clone()).unwrap();
+        let mut hasher = Sha256::new();
+
+        info!("{} \"{}\"", "Hashing".green().bold(), from.display());
+        let file_size = read_from.metadata().unwrap().len();
+        let max_buf_size = 1024 * 1024 * 1024 * 4;
+        let buf_size = file_size.min(max_buf_size);
+        let mut buf = Vec::with_capacity(buf_size as usize);
+        while read_from.read(&mut buf).unwrap() != 0 {
+            hasher.update(&buf);
+        }
+
+        config.with_section(Some(format!("Backup.{}", h))).set(
+            from.display().to_string(),
+            format!(
+                "{}{SEPARATOR}{:X}",
+                to.display().to_string(),
+                hasher.finalize()
+            ),
+        );
+        pb.inc(1);
+    }
+    pb.finish();
+    multi.remove(&pb);
+    t.join().unwrap();
     config.write_to_file(config_dir.join("config.ini")).unwrap();
+
+    let pb = multi.add(ProgressBar::new(conclusion.total_count as u64));
+
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} {msg:.blue.bold} [{bar:50.cyan/blue}] {human_pos}/{human_len} [{elapsed_precise}] ({eta})",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
+    pb.set_message("Verifying");
+
+    pb.set_position(0);
+
+    let pb_clone = pb.clone();
+    let t = _pb_update(pb_clone);
+
+    for (k, v) in config.section(Some(format!("Backup.{}", h))).unwrap() {
+        let mut split = v.split(SEPARATOR);
+        let to = split.nth(0).unwrap();
+        let mut read_from = File::open(to).unwrap();
+        let mut hasher = Sha256::new();
+
+        info!("{} \"{to}\"", "Verifying".green().bold());
+        let file_size = read_from.metadata().unwrap().len();
+        let max_buf_size = 1024 * 1024 * 1024 * 4;
+        let buf_size = file_size.min(max_buf_size);
+        let mut buf = Vec::with_capacity(buf_size as usize);
+        while read_from.read(&mut buf).unwrap() != 0 {
+            hasher.update(&buf);
+        }
+
+        if format!("{:X}", hasher.finalize()) != split.nth(0).unwrap() {
+            info!("\n{} \"{to}\"", "Copying".green().bold());
+            fs::copy(k, to).unwrap();
+        }
+        pb.inc(1);
+    }
+    pb.finish();
+    t.join().unwrap();
 
     // Formatting the size info.
     let size_str = conclusion.total_size.to_string();
@@ -248,23 +339,21 @@ fn _copy(
     false
 }
 
-fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
+fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> (Conclusion, MultiProgress) {
     let mut stack = VecDeque::new();
     stack.push_front(src);
     let mut file_list: VecDeque<(DirEntry, &OsString, &PathBuf)> = VecDeque::new();
     let mut error_count = 0;
     let mut error_list = Vec::new();
     let mut total_size = FileSize::new();
+    let mut path_list = Vec::new();
     let mut curr_progress = 0;
 
     let multi = MultiProgress::new();
     multi.set_move_cursor(true);
 
-    #[cfg(not(test))]
-    {
-        let logger = colog::default_builder().build();
-        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
-    }
+    let logger = colog::default_builder().build();
+    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
 
@@ -296,6 +385,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
                 let dir_content = match fs::read_dir(&entry_path) {
                     Ok(v) => v,
                     Err(e) => match e.raw_os_error().unwrap_or(0) {
+                        // We copy the currently discovered files if we reach fd limit
                         24 => {
                             error!("Too many file handles open, switching to copying.");
                             for _ in 0..5 {
@@ -329,16 +419,20 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
                                     FileSize::from(progress).to_string().bold()
                                 );
 
-                                if let Err(e) = _copy_file(&f.0, f.1, f.2) {
-                                    let err = format!(
-                                        "Couldn't copy {:#?} because of error: {e}. Skipping\n",
-                                        p
-                                    );
-                                    error!("{}", err);
-                                    error_count += 1;
-                                    error_list.push(err);
-                                    continue;
-                                }
+                                let dest_path = match _copy_file(&f.0, f.1, f.2) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        let err = format!(
+                                            "Couldn't copy {:#?} because of error: {e}. Skipping\n",
+                                            p
+                                        );
+                                        error!("{}", err);
+                                        error_count += 1;
+                                        error_list.push(err);
+                                        continue;
+                                    }
+                                };
+                                path_list.push((p, dest_path));
                                 pb.inc(progress);
                             }
                             pb.finish();
@@ -402,13 +496,17 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
             FileSize::from(progress).to_string().bold()
         );
 
-        if let Err(e) = _copy_file(&f.0, f.1, f.2) {
-            let err = format!("Couldn't copy {:#?} because of error: {e}. Skipping\n", p);
-            error!("{}", err);
-            error_count += 1;
-            error_list.push(err);
-            continue;
-        }
+        let dest_path = match _copy_file(&f.0, f.1, f.2) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = format!("Couldn't copy {:#?} because of error: {e}. Skipping\n", p);
+                error!("{}", err);
+                error_count += 1;
+                error_list.push(err);
+                continue;
+            }
+        };
+        path_list.push((p, dest_path));
         pb.inc(progress);
     }
 
@@ -417,12 +515,16 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
     t.join().unwrap();
 
     total_size.update();
-    return Conclusion {
-        total_count,
-        error_count,
-        error_list,
-        total_size,
-    };
+    return (
+        Conclusion {
+            total_count,
+            error_count,
+            error_list,
+            total_size,
+            path_list,
+        },
+        multi,
+    );
 }
 
 fn _pb_update(pb_clone: ProgressBar) -> JoinHandle<()> {
@@ -434,10 +536,12 @@ fn _pb_update(pb_clone: ProgressBar) -> JoinHandle<()> {
     })
 }
 
-fn multithread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
+// Multithead doesn't work on very big directories for some reason.
+// I'll try to fix that soon
+fn multithread(src: ReadDir, dest: PathBuf, src_name: OsString) -> (Conclusion, MultiProgress) {
     let conclusion = Arc::new(Mutex::new(Conclusion::new()));
 
-    _multithread(src, dest, src_name, conclusion.clone());
+    let multi = _multithread(src, dest, src_name, conclusion.clone());
 
     let guard = conclusion.lock().unwrap();
     let new = Conclusion {
@@ -445,8 +549,9 @@ fn multithread(src: ReadDir, dest: PathBuf, src_name: OsString) -> Conclusion {
         error_count: guard.error_count,
         error_list: guard.error_list.clone(),
         total_size: guard.total_size,
+        path_list: guard.path_list.clone(),
     };
-    return new;
+    return (new, multi);
 }
 
 fn _multithread(
@@ -454,18 +559,15 @@ fn _multithread(
     dest: PathBuf,
     src_name: OsString,
     conclusion: Arc<Mutex<Conclusion>>,
-) {
+) -> MultiProgress {
     let files_list = Arc::new(Mutex::new(Vec::new()));
     let mut thread_pool = Vec::new();
 
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(255));
     multi.set_move_cursor(true);
 
-    #[cfg(not(test))]
-    {
-        let logger = colog::default_builder().build();
-        LogWrapper::new(multi.clone(), logger).try_init().unwrap();
-    }
+    let logger = colog::default_builder().build();
+    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
 
     if let Outcome::LimitRaised { from, to } = raise_fd_limit().unwrap() {
         info!("Increased max files open limit from {} to {}", from, to);
@@ -524,14 +626,15 @@ fn _multithread(
 
             info!("{} {:#?}", "Copying".green().bold(), p);
 
+            let mut guard = conclusion_clone.lock().unwrap();
             if let Err(e) = _copy_file(&e.0, &e.1, &e.2) {
                 let err = format!("Couldn't copy {:#?} because of error: {e}", p);
                 error!("{}", err);
-                let mut guard = conclusion_clone.lock().unwrap();
                 guard.error_count += 1;
                 guard.error_list.push(err);
                 return;
             }
+            guard.path_list.push((p, e.2.clone()));
             pb_clone.inc(progress);
         }));
     }
@@ -541,6 +644,7 @@ fn _multithread(
     }
     pb.finish();
     t.join().unwrap();
+    multi
 }
 
 fn _multithread_discover(
@@ -606,7 +710,7 @@ fn _multithread_discover(
     conclusion.lock().unwrap().total_size.update();
 }
 
-fn _copy_file(entry: &DirEntry, src_name: &OsString, dest: &PathBuf) -> io::Result<()> {
+fn _copy_file(entry: &DirEntry, src_name: &OsString, dest: &PathBuf) -> io::Result<PathBuf> {
     // Get the full path of the entry
     let full_path = entry.path();
 
@@ -643,5 +747,5 @@ fn _copy_file(entry: &DirEntry, src_name: &OsString, dest: &PathBuf) -> io::Resu
     let file_name = entry.file_name();
     let dest_path = dest_dir.join(file_name);
     fs::copy(&full_path, &dest_path)?;
-    Ok(())
+    Ok(dest_path)
 }
