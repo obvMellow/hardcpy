@@ -112,6 +112,7 @@ enum Commands {
         id: String,
 
         #[arg(short, long)]
+        /// Enables multithreading. This feature is not complete and can be unstable
         multithread: bool,
     },
     /// Creates a backup
@@ -120,6 +121,7 @@ enum Commands {
         dest: PathBuf,
 
         #[arg(short, long)]
+        /// Enables multithreading. This feature is not complete and can be unstable
         multithread: bool,
     },
     /// Verifies that the tracked source files match destination files
@@ -129,6 +131,8 @@ enum Commands {
 const SEPARATOR: char = '┇';
 
 fn main() {
+    let args = Args::parse();
+
     let mut config_dir = dirs::config_dir().unwrap_or_else(|| {
         println!(
             "{} Couldn't get a config directory, using current directory.",
@@ -140,8 +144,6 @@ fn main() {
     fs::create_dir_all(&config_dir).unwrap();
 
     let mut config = Ini::load_from_file(config_dir.join("config.ini")).unwrap_or(Ini::new());
-
-    let args = Args::parse();
 
     match args.command {
         Commands::List => list(config),
