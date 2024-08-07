@@ -423,7 +423,7 @@ fn singlethread(src: ReadDir, dest: PathBuf, src_name: OsString) -> (Conclusion,
     multi.set_move_cursor(true);
 
     let logger = colog::default_builder().build();
-    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    let _ = LogWrapper::new(multi.clone(), logger).try_init();
 
     let pb = multi.add(ProgressBar::new(u64::MAX));
 
@@ -637,7 +637,7 @@ fn _multithread(
     multi.set_move_cursor(true);
 
     let logger = colog::default_builder().build();
-    LogWrapper::new(multi.clone(), logger).try_init().unwrap();
+    let _ = LogWrapper::new(multi.clone(), logger).try_init();
 
     if let Outcome::LimitRaised { from, to } = raise_fd_limit().unwrap() {
         info!("Increased max files open limit from {} to {}", from, to);

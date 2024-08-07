@@ -1,9 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::_copy;
-    use colored::Colorize;
-    use ini::Ini;
     use rand::Rng;
+    use rusqlite::Connection;
     use std::fs;
     use std::fs::File;
     use std::io::Write;
@@ -12,17 +11,31 @@ mod tests {
     const FILE_SIZE_S: usize = 1024 * 1024;
     #[test]
     fn create_backup_singlethread() {
-        let mut config_dir = dirs::config_dir().unwrap_or_else(|| {
-            println!(
-                "{} Couldn't get a config directory, using current directory.",
-                "[INFO]".bright_yellow()
-            );
-            std::env::current_dir().unwrap()
-        });
-        config_dir.push("hardcpy");
-        fs::create_dir_all(&config_dir).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tx = conn.transaction().unwrap();
 
-        let mut config = Ini::load_from_file(config_dir.join("config.ini")).unwrap_or(Ini::new());
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS Backups (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            compression TEXT
+        )",
+            (),
+        )
+        .unwrap();
+
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS Files (
+            backup_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            PRIMARY KEY (source, dest)
+        )",
+            (),
+        )
+        .unwrap();
 
         fs::create_dir_all("test/test_singlethread/source").unwrap();
         fs::create_dir_all("test/test_singlethread/dest").unwrap();
@@ -37,8 +50,7 @@ mod tests {
         f.flush().unwrap();
 
         _copy(
-            config_dir.clone(),
-            &mut config,
+            &tx,
             false,
             "test/test_singlethread/source".into(),
             "test/test_singlethread/dest".into(),
@@ -47,17 +59,31 @@ mod tests {
 
     #[test]
     fn create_backup_multithread() {
-        let mut config_dir = dirs::config_dir().unwrap_or_else(|| {
-            println!(
-                "{} Couldn't get a config directory, using current directory.",
-                "[INFO]".bright_yellow()
-            );
-            std::env::current_dir().unwrap()
-        });
-        config_dir.push("hardcpy");
-        fs::create_dir_all(&config_dir).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tx = conn.transaction().unwrap();
 
-        let mut config = Ini::load_from_file(config_dir.join("config.ini")).unwrap_or(Ini::new());
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS Backups (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            compression TEXT
+        )",
+            (),
+        )
+        .unwrap();
+
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS Files (
+            backup_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            PRIMARY KEY (source, dest)
+        )",
+            (),
+        )
+        .unwrap();
 
         fs::create_dir_all("test/test_multithread/source").unwrap();
         fs::create_dir_all("test/test_multithread/dest").unwrap();
@@ -75,8 +101,7 @@ mod tests {
         }
 
         _copy(
-            config_dir.clone(),
-            &mut config,
+            &tx,
             true,
             "test/test_multithread/source".into(),
             "test/test_multithread/dest".into(),
