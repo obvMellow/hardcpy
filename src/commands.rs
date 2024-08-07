@@ -3,12 +3,12 @@ use colored::Colorize;
 use indicatif::{HumanCount, MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{error, info};
-use rusqlite::{Connection, Result};
+use rusqlite::{Result, Transaction};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 
-pub fn verify(conn: &mut Connection, id: u64) {
+pub fn verify(conn: &Transaction, id: u64) {
     let mut error_list = Vec::new();
     let mut verified = 0;
     let mut real_count = 0;
@@ -120,13 +120,13 @@ pub fn verify(conn: &mut Connection, id: u64) {
     );
 }
 
-fn _count_matches(conn: &Connection, id: i64) -> Result<usize> {
+fn _count_matches(conn: &Transaction, id: i64) -> Result<usize> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM Files WHERE backup_id = ?1")?;
     let count: i64 = stmt.query_row([id], |row| row.get(0))?;
     Ok(count as usize)
 }
 
-pub fn revert(conn: &mut Connection, id: u64, multithread: bool) {
+pub fn revert(conn: &Transaction, id: u64, multithread: bool) {
     let mut stmt = conn
         .prepare("SELECT source, dest FROM Backups WHERE id = ?1")
         .unwrap();
@@ -155,7 +155,7 @@ pub fn revert(conn: &mut Connection, id: u64, multithread: bool) {
     _copy(conn, multithread, source_str.into(), dest_str.into());
 }
 
-pub fn delete(conn: &mut Connection, id: u64) {
+pub fn delete(conn: &Transaction, id: u64) {
     let mut stmt = conn
         .prepare("SELECT dest FROM Backups WHERE id = ?1")
         .unwrap();
@@ -187,7 +187,7 @@ pub fn delete(conn: &mut Connection, id: u64) {
     _delete_entry(conn, id);
 }
 
-pub fn soft_delete(conn: &mut Connection, id: u64) {
+pub fn soft_delete(conn: &Transaction, id: u64) {
     if _delete_entry(conn, id) {
         println!("Deleted {}", id);
         return;
@@ -195,7 +195,7 @@ pub fn soft_delete(conn: &mut Connection, id: u64) {
     eprintln!("Couldn't find \"{}\".", id);
 }
 
-pub fn list(conn: &mut Connection) {
+pub fn list(conn: &Transaction) {
     let mut stmt = conn
         .prepare("SELECT id, source, dest, compression FROM Backups")
         .unwrap();
@@ -225,7 +225,7 @@ pub fn list(conn: &mut Connection) {
     }
 }
 
-fn _delete_entry(conn: &mut Connection, id: u64) -> bool {
+fn _delete_entry(conn: &Transaction, id: u64) -> bool {
     match conn
         .execute("DELETE FROM Backups WHERE id = ?1", [id as i64])
         .unwrap()

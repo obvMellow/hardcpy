@@ -3,7 +3,7 @@ mod test;
 
 use fdlimit::{raise_fd_limit, Outcome};
 use indicatif_log_bridge::LogWrapper;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use sha2::{Digest, Sha256};
 
 use crate::commands::*;
@@ -158,8 +158,9 @@ fn main() {
     fs::create_dir_all(&db_dir).unwrap();
 
     let mut conn = Connection::open(db_dir.join("backups.db")).unwrap();
+    let mut tx = conn.transaction().unwrap();
 
-    conn.execute(
+    tx.execute(
         "CREATE TABLE IF NOT EXISTS Backups (
             id INTEGER PRIMARY KEY,
             source TEXT NOT NULL,
@@ -170,7 +171,7 @@ fn main() {
     )
     .unwrap();
 
-    conn.execute(
+    tx.execute(
         "CREATE TABLE IF NOT EXISTS Files (
             backup_id INTEGER NOT NULL,
             source TEXT NOT NULL,
@@ -183,27 +184,23 @@ fn main() {
     .unwrap();
 
     match args.command {
-        Commands::List => list(&mut conn),
-        Commands::SoftDelete { id } => soft_delete(&mut conn, id),
-        Commands::Delete { id } => delete(&mut conn, id),
-        Commands::Revert { id, multithread } => revert(&mut conn, id, multithread),
+        Commands::List => list(&tx),
+        Commands::SoftDelete { id } => soft_delete(&tx, id),
+        Commands::Delete { id } => delete(&tx, id),
+        Commands::Revert { id, multithread } => revert(&tx, id, multithread),
         Commands::Create {
             source,
             dest,
             multithread,
         } => {
-            _copy(&mut conn, multithread, source, dest);
+            _copy(&tx, multithread, source, dest);
         }
-        Commands::Verify { id } => verify(&mut conn, id),
+        Commands::Verify { id } => verify(&mut tx, id),
     }
+    tx.commit().unwrap();
 }
 
-fn _copy(
-    conn: &mut Connection,
-    is_multithread: bool,
-    source_str: PathBuf,
-    dest_str: PathBuf,
-) -> bool {
+fn _copy(conn: &Transaction, is_multithread: bool, source_str: PathBuf, dest_str: PathBuf) -> bool {
     let source_name = source_str.iter().last().unwrap().to_owned();
 
     let source = match fs::read_dir(&source_str) {
