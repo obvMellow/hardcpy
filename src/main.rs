@@ -3,13 +3,13 @@ mod test;
 
 use fdlimit::{raise_fd_limit, Outcome};
 use indicatif_log_bridge::LogWrapper;
+use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
 use crate::commands::*;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use ini::Ini;
 use log::{error, info};
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -104,12 +104,12 @@ enum Commands {
     /// Lists all backups saved
     List,
     /// Deletes the entry for a backup. Doesn't delete the actual files
-    SoftDelete { id: String },
+    SoftDelete { id: u64 },
     /// Deletes the backup
-    Delete { id: String },
+    Delete { id: u64 },
     /// Reverts a backup. Copies destination to source, recovering the source
     Revert {
-        id: String,
+        id: u64,
 
         #[arg(short, long)]
         /// Enables multithreading. This feature is not complete and can be unstable
@@ -125,45 +125,81 @@ enum Commands {
         multithread: bool,
     },
     /// Verifies that the tracked source files match destination files
-    Verify { id: String },
+    Verify { id: u64 },
 }
 
-const SEPARATOR: char = '┇';
+#[derive(Debug)]
+struct BackupEntry {
+    id: u64,
+    from: PathBuf,
+    to: PathBuf,
+    compression: Option<String>,
+}
+
+#[derive(Debug)]
+struct FileEntry {
+    backup_id: u64,
+    from: PathBuf,
+    to: PathBuf,
+    sha256: String,
+}
 
 fn main() {
     let args = Args::parse();
 
-    let mut config_dir = dirs::config_dir().unwrap_or_else(|| {
+    let mut db_dir = dirs::config_dir().unwrap_or_else(|| {
         println!(
             "{} Couldn't get a config directory, using current directory.",
             "[INFO]".bright_yellow()
         );
         std::env::current_dir().unwrap()
     });
-    config_dir.push("hardcpy");
-    fs::create_dir_all(&config_dir).unwrap();
+    db_dir.push("hardcpy");
+    fs::create_dir_all(&db_dir).unwrap();
 
-    let mut config = Ini::load_from_file(config_dir.join("config.ini")).unwrap_or(Ini::new());
+    let mut conn = Connection::open(db_dir.join("backups.db")).unwrap();
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS Backups (
+            id INTEGER PRIMARY KEY,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            compression TEXT
+        )",
+        (),
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS Files (
+            backup_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            dest TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            PRIMARY KEY (source, dest)
+        )",
+        (),
+    )
+    .unwrap();
 
     match args.command {
-        Commands::List => list(config),
-        Commands::SoftDelete { id } => soft_delete(config_dir, config, id),
-        Commands::Delete { id } => delete(config_dir, config, id),
-        Commands::Revert { id, multithread } => revert(config_dir, config, id, multithread),
+        Commands::List => list(&mut conn),
+        Commands::SoftDelete { id } => soft_delete(&mut conn, id),
+        Commands::Delete { id } => delete(&mut conn, id),
+        Commands::Revert { id, multithread } => revert(&mut conn, id, multithread),
         Commands::Create {
             source,
             dest,
             multithread,
         } => {
-            _copy(config_dir, &mut config, multithread, source, dest);
+            _copy(&mut conn, multithread, source, dest);
         }
-        Commands::Verify { id } => verify(config, id),
+        Commands::Verify { id } => verify(&mut conn, id),
     }
 }
 
 fn _copy(
-    config_dir: PathBuf,
-    config: &mut Ini,
+    conn: &mut Connection,
     is_multithread: bool,
     source_str: PathBuf,
     dest_str: PathBuf,
@@ -202,14 +238,23 @@ fn _copy(
     }
 
     let v = format!(
-        "{}{SEPARATOR}{}",
+        "{}{}",
         source_str.display(),
         dest_str.join(source_name.clone()).to_str().unwrap()
     );
     let mut hasher = fnv::FnvHasher::default();
     v.hash(&mut hasher);
-    let h = hasher.finish().to_string();
-    config.with_section(Some("Backups")).set(h.clone(), v);
+    let h = hasher.finish();
+    conn.execute(
+        "INSERT OR REPLACE INTO Backups (id, source, dest, compression) VALUES (?1, ?2, ?3, ?4)",
+        (
+            h as i64,
+            source_str.display().to_string(),
+            dest_str.display().to_string(),
+            None::<String>,
+        ),
+    )
+    .unwrap();
 
     multi.clear().unwrap();
     multi.set_move_cursor(true);
@@ -247,20 +292,22 @@ fn _copy(
             hasher.update(&buf);
         }
 
-        config.with_section(Some(format!("Backup.{}", h))).set(
-            from.display().to_string(),
-            format!(
-                "{}{SEPARATOR}{:X}",
+        conn.execute(
+            r#"INSERT OR REPLACE INTO Files (backup_id, source, dest, sha256) VALUES (?1, ?2, ?3, ?4)
+        "#,
+            (
+                h as i64,
+                from.display().to_string(),
                 to.display().to_string(),
-                hasher.finalize()
+                format!("{:x}", hasher.finalize()),
             ),
-        );
+        )
+        .unwrap();
         pb.inc(1);
     }
     pb.finish();
     multi.remove(&pb);
     t.join().unwrap();
-    config.write_to_file(config_dir.join("config.ini")).unwrap();
 
     let pb = multi.add(ProgressBar::new(conclusion.total_count as u64));
 
@@ -278,13 +325,30 @@ fn _copy(
     let pb_clone = pb.clone();
     let t = _pb_update(pb_clone);
 
-    for (k, v) in config.section(Some(format!("Backup.{}", h))).unwrap() {
-        let mut split = v.split(SEPARATOR);
-        let to = split.nth(0).unwrap();
-        let mut read_from = File::open(to).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT source, dest, sha256 FROM Files WHERE backup_id = ?1")
+        .unwrap();
+    let iter = stmt
+        .query_map([h as i64], |row| {
+            Ok(FileEntry {
+                backup_id: h,
+                from: row.get::<usize, String>(0).unwrap().into(),
+                to: row.get::<usize, String>(1).unwrap().into(),
+                sha256: row.get_unwrap(2),
+            })
+        })
+        .unwrap();
+
+    for entry in iter {
+        let entry = entry.unwrap();
+        let mut read_from = File::open(&entry.to).unwrap();
         let mut hasher = Sha256::new();
 
-        info!("{} \"{to}\"", "Verifying".green().bold());
+        info!(
+            "{} \"{}\"",
+            "Verifying".green().bold(),
+            entry.to.display().to_string()
+        );
         let file_size = read_from.metadata().unwrap().len();
         let max_buf_size = 1024 * 1024 * 1024 * 4;
         let buf_size = file_size.min(max_buf_size);
@@ -293,9 +357,13 @@ fn _copy(
             hasher.update(&buf);
         }
 
-        if format!("{:X}", hasher.finalize()) != split.nth(0).unwrap() {
-            info!("\n{} \"{to}\"", "Copying".green().bold());
-            fs::copy(k, to).unwrap();
+        if format!("{:x}", hasher.finalize()) != entry.sha256 {
+            info!(
+                "\n{} \"{}\"",
+                "Copying".green().bold(),
+                entry.to.display().to_string()
+            );
+            fs::copy(entry.from, entry.to).unwrap();
         }
         pb.inc(1);
     }
