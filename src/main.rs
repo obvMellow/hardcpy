@@ -18,7 +18,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::string::ToString;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::{fs, io};
@@ -30,6 +31,13 @@ struct Conclusion {
     pub error_list: Vec<String>,
     pub total_size: FileSize,
     pub path_list: Vec<(PathBuf, PathBuf)>,
+}
+
+enum ConclusionFields {
+    TotalCount(usize),
+    Error(String),
+    FileSize(FileSize),
+    PathCouple((PathBuf, PathBuf)),
 }
 
 #[derive(Copy, Clone)]
@@ -60,6 +68,13 @@ impl FileSize {
             kb: 0,
             byte: 0,
         }
+    }
+
+    pub fn from_bytes(bytes: usize) -> Self {
+        let mut o = Self::new();
+        o.byte += bytes;
+        o.update();
+        o
     }
 
     pub fn update(&mut self) {
@@ -606,32 +621,24 @@ fn _pb_update(pb_clone: ProgressBar) -> JoinHandle<()> {
     })
 }
 
-// Multithead doesn't work on very big directories for some reason.
-// I'll try to fix that soon
 fn multithread(src: ReadDir, dest: PathBuf, src_name: OsString) -> (Conclusion, MultiProgress) {
-    let conclusion = Arc::new(Mutex::new(Conclusion::new()));
+    let mut conclusion = Conclusion::new();
 
-    let multi = _multithread(src, dest, src_name, conclusion.clone());
+    let multi = _multithread(src, dest, src_name, &mut conclusion);
 
-    let guard = conclusion.lock().unwrap();
-    let new = Conclusion {
-        total_count: guard.total_count,
-        error_count: guard.error_count,
-        error_list: guard.error_list.clone(),
-        total_size: guard.total_size,
-        path_list: guard.path_list.clone(),
-    };
-    return (new, multi);
+    return (conclusion, multi);
 }
 
 fn _multithread(
     src: ReadDir,
     dest: PathBuf,
     src_name: OsString,
-    conclusion: Arc<Mutex<Conclusion>>,
+    conclusion: &mut Conclusion,
 ) -> MultiProgress {
-    let files_list = Arc::new(Mutex::new(Vec::new()));
+    let mut files_list = Vec::new();
     let mut thread_pool = Vec::new();
+    let (conclusion_send, conclusion_recv) = mpsc::channel();
+    let (files_list_send, files_list_recv) = mpsc::channel();
 
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(255));
     multi.set_move_cursor(true);
@@ -662,16 +669,34 @@ fn _multithread(
         src,
         dest,
         src_name,
-        conclusion.clone(),
-        files_list.clone(),
+        conclusion_send,
+        files_list_send,
         pb.clone(),
     );
     pb.finish();
     t.join().unwrap();
     multi.remove(&pb);
 
-    let total = conclusion.lock().unwrap().total_size.byte as u64;
-    let pb = multi.add(ProgressBar::new(total));
+    while let Ok(v) = conclusion_recv.recv() {
+        match v {
+            ConclusionFields::TotalCount(x) => conclusion.total_count += x,
+            ConclusionFields::Error(x) => {
+                conclusion.error_count += 1;
+                conclusion.error_list.push(x)
+            }
+            ConclusionFields::FileSize(x) => {
+                conclusion.total_size.byte += x.byte;
+                conclusion.total_size.update();
+            }
+            ConclusionFields::PathCouple(x) => conclusion.path_list.push(x),
+        }
+    }
+
+    while let Ok(v) = files_list_recv.recv() {
+        files_list.push(v);
+    }
+
+    let pb = multi.add(ProgressBar::new(conclusion.total_size.byte as u64));
     pb.set_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} ({eta})",
@@ -685,10 +710,9 @@ fn _multithread(
     let pb_clone = pb.clone();
     let t = _pb_update(pb_clone);
 
-    let files_list_clone = files_list.clone();
-    let mut lock = files_list_clone.lock().unwrap();
-    while let Some(e) = lock.pop() {
-        let conclusion_clone = conclusion.clone();
+    let (conclusion_send, conclusion_recv) = mpsc::channel();
+    while let Some(e) = files_list.pop() {
+        let conclusion_clone = conclusion_send.clone();
         let pb_clone = pb.clone();
         thread_pool.push(std::thread::spawn(move || {
             let p = e.0.path();
@@ -696,17 +720,36 @@ fn _multithread(
 
             info!("{} {:#?}", "Copying".green().bold(), p);
 
-            let mut guard = conclusion_clone.lock().unwrap();
-            if let Err(e) = _copy_file(&e.0, &e.1, &e.2) {
-                let err = format!("Couldn't copy {:#?} because of error: {e}", p);
-                error!("{}", err);
-                guard.error_count += 1;
-                guard.error_list.push(err);
-                return;
-            }
-            guard.path_list.push((p, e.2.clone()));
+            let t = match _copy_file(&e.0, &e.1, &e.2) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err = format!("Couldn't copy {:#?} because of error: {e}", p);
+                    error!("{}", err);
+                    conclusion_clone.send(ConclusionFields::Error(err)).unwrap();
+                    return;
+                }
+            };
+            conclusion_clone
+                .send(ConclusionFields::PathCouple((p, t)))
+                .unwrap();
             pb_clone.inc(progress);
         }));
+    }
+    drop(conclusion_send);
+
+    while let Ok(v) = conclusion_recv.recv() {
+        match v {
+            ConclusionFields::TotalCount(x) => conclusion.total_count += x,
+            ConclusionFields::Error(x) => {
+                conclusion.error_count += 1;
+                conclusion.error_list.push(x)
+            }
+            ConclusionFields::FileSize(x) => {
+                conclusion.total_size.byte += x.byte;
+                conclusion.total_size.update();
+            }
+            ConclusionFields::PathCouple(x) => conclusion.path_list.push(x),
+        }
     }
 
     for thread in thread_pool {
@@ -721,12 +764,10 @@ fn _multithread_discover(
     src: ReadDir,
     dest: PathBuf,
     src_name: OsString,
-    conclusion: Arc<Mutex<Conclusion>>,
-    files_list: Arc<Mutex<Vec<(DirEntry, OsString, PathBuf)>>>,
+    conclusion_chan: Sender<ConclusionFields>,
+    files_list_chan: Sender<(DirEntry, OsString, PathBuf)>,
     pb: ProgressBar,
 ) {
-    let mut thread_pool = Vec::new();
-
     for f in src {
         let entry = f.unwrap();
 
@@ -739,16 +780,16 @@ fn _multithread_discover(
                         entry.path()
                     );
                     error!("{}", err);
-                    conclusion.lock().unwrap().error_list.push(err);
+                    conclusion_chan.send(ConclusionFields::Error(err)).unwrap();
                     continue;
                 }
             };
             let dest = dest.clone();
             let src_name = src_name.clone();
-            let conclusion_clone = conclusion.clone();
-            let files_list_clone = files_list.clone();
+            let conclusion_clone = conclusion_chan.clone();
+            let files_list_clone = files_list_chan.clone();
             let pb_clone = pb.clone();
-            thread_pool.push(std::thread::spawn(move || {
+            std::thread::spawn(move || {
                 _multithread_discover(
                     dir,
                     dest,
@@ -757,27 +798,25 @@ fn _multithread_discover(
                     files_list_clone,
                     pb_clone,
                 );
-            }));
+            });
         }
 
         if entry.file_type().unwrap().is_file() {
             info!("{} {:#?}", "Discovered".green().bold(), entry.path());
-            let mut lock = conclusion.lock().unwrap();
-            lock.total_size.byte += entry.metadata().unwrap().len() as usize;
-            lock.total_count += 1;
-            files_list
-                .lock()
-                .unwrap()
-                .push((entry, src_name.clone(), dest.clone()));
+            conclusion_chan
+                .send(ConclusionFields::FileSize(FileSize::from_bytes(
+                    entry.metadata().unwrap().len() as usize,
+                )))
+                .unwrap();
+            conclusion_chan
+                .send(ConclusionFields::TotalCount(1))
+                .unwrap();
+            files_list_chan
+                .send((entry, src_name.clone(), dest.clone()))
+                .unwrap();
             pb.inc(1);
         }
     }
-
-    for thread in thread_pool {
-        thread.join().unwrap();
-    }
-
-    conclusion.lock().unwrap().total_size.update();
 }
 
 fn _copy_file(entry: &DirEntry, src_name: &OsString, dest: &PathBuf) -> io::Result<PathBuf> {
