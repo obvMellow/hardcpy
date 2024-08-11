@@ -416,10 +416,20 @@ fn _copy(conn: &Transaction, is_multithread: bool, source_str: PathBuf, dest_str
     );
 
     if conclusion.error_list.len() > 0 {
-        let mut log_file = File::create("hardcpy.log").unwrap();
+        let log_folder = dirs::config_dir()
+            .unwrap_or(std::env::current_dir().unwrap())
+            .join("hardcpy/logs");
+        fs::create_dir_all(&log_folder).unwrap();
+
+        let path = log_folder.join(chrono::Local::now().to_rfc2822());
+        let mut log_file = File::create(&path).unwrap();
         for err in conclusion.error_list {
-            log_file.write_all(err.as_ref()).unwrap();
+            log_file
+                .write_all(err.replace(" Skipping", "").as_ref())
+                .unwrap();
         }
+
+        error!("Errors were written to \"{}\"", path.display().to_string());
     }
     false
 }
