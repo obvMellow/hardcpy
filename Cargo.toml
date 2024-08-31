@@ -1,6 +1,6 @@
 [package]
 name = "hardcpy"
-version = "0.2.0"
+version = "0.2.1"
 description = "Simple backup tool written in Rust"
 authors = ["Deniz Demir <darkenedMellow@protonmail.com>"]
 license = "GPL-3.0-or-later"
